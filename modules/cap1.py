@@ -21,6 +21,62 @@ class CapitalOneVCCDeleter:
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         }
 
+    def _fetch_single_page(self, card_reference_id: str, offset: int, limit: int, payload: dict) -> list[VCCEntry]:
+        page_url = f"https://myaccounts.capitalone.com/web-api/private/25419/commerce-virtual-numbers?limit={limit}&offset={offset}"
+        print(f"Fetching VCCs for {card_reference_id} (offset: {offset})")
+        
+        while True:
+            response = self.session.post(page_url, json=payload)
+            if "id" in response.json() and response.json()["id"] == "800000":
+                print(f"Retrying offset {offset} due to error: {response.text.strip()}")
+                continue
+            return [VCCEntry(**entry) for entry in response.json()["entries"]]
+
+    def _fetch_card_vccs(self, card_reference_id: str, search: str = None) -> list[VCCEntry]:
+        limit = 50
+        url = f"https://myaccounts.capitalone.com/web-api/private/25419/commerce-virtual-numbers?limit={limit}&offset=0"
+        payload = {
+            "referenceId": card_reference_id,
+            "referenceIdType": "ACCOUNT",
+            "tokenStatus": ["ACTIVE"],
+            "filterCriteria": [],
+            "sortCriteria": []
+        }
+        if search:
+            payload["filterCriteria"].append({"field": "TOKEN_NAME", "value": search, "operator": "LIKE"})
+
+        self.session.headers["accept"] = "application/json;v=2"
+
+        while True:
+            response = self.session.post(url, json=payload)
+            if "id" in response.json() and response.json()["id"] == "800000":
+                print(f"Retrying initial request due to error: {response.text.strip()}")
+                continue
+            break
+
+        total_count = response.json()["count"]
+        max_offset = (total_count + limit - 1) // limit 
+        all_entries = [VCCEntry(**entry) for entry in response.json()["entries"]]
+
+        if max_offset > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                future_to_offset = {
+                    executor.submit(self._fetch_single_page, card_reference_id, offset, limit, payload): offset 
+                    for offset in range(1, max_offset)
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_offset):
+                    offset = future_to_offset[future]
+                    try:
+                        entries = future.result()
+                        all_entries.extend(entries)
+                        print(f"Found {len(all_entries)}/{total_count} entries for {card_reference_id}")
+                    except Exception as e:
+                        print(f"Error fetching offset {offset}: {str(e)}")
+
+        print(f"Finished fetching VCCs for {card_reference_id}. Found {len(all_entries)}/{total_count} entries")
+        return all_entries
+    
     def get_accounts(self):
         self.session.headers["accept"] = "application/json;v=1"
         response = self.session.get("https://myaccounts.capitalone.com/web-api/private/1491939/edge/customer/profile/preferences")
@@ -29,72 +85,16 @@ class CapitalOneVCCDeleter:
         self.card_ids = result["accountDisplayOrder"]
 
     def get_all_vccs(self, search: str = None) -> list[VCCEntry]:
-        def fetch_vcc(card_reference_id: str, search: str = None) -> list[VCCEntry]:
-            limit = 50
-            url = f"https://myaccounts.capitalone.com/web-api/private/25419/commerce-virtual-numbers?limit={limit}&offset=0"
-            payload = {
-                "referenceId": card_reference_id,
-                "referenceIdType": "ACCOUNT",
-                "tokenStatus": ["ACTIVE"],
-                "filterCriteria": [],
-                "sortCriteria": []
-            }
-            if search:
-                payload["filterCriteria"].append({"field": "TOKEN_NAME", "value": search, "operator": "LIKE"})
-
-            self.session.headers["accept"] = "application/json;v=2"
-            
-            while True:
-                response = self.session.post(url, json=payload)
-                if "id" in response.json() and response.json()["id"] == "800000":
-                    print(f"Retrying initial request due to error: {response.text.strip()}")
-                    continue
-                break
-
-            total_count = response.json()["count"]
-            max_offset = (total_count + limit - 1) // limit 
-            def fetch_page(offset: int) -> list[VCCEntry]:
-                while True:
-                    page_url = f"https://myaccounts.capitalone.com/web-api/private/25419/commerce-virtual-numbers?limit={limit}&offset={offset}"
-                    print(f"Fetching VCCs for {card_reference_id} (offset: {offset})")
-                    
-                    response = self.session.post(page_url, json=payload)
-                    if "id" in response.json() and response.json()["id"] == "800000":
-                        print(f"Retrying offset {offset} due to error: {response.text.strip()}")
-                        continue
-                    
-                    return [VCCEntry(**entry) for entry in response.json()["entries"]]
-
-            all_entries = []
-            all_entries.extend([VCCEntry(**entry) for entry in response.json()["entries"]])
-            
-            if max_offset > 1:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-                    future_to_offset = {
-                        executor.submit(fetch_page, offset): offset 
-                        for offset in range(1, max_offset)
-                    }
-                    
-                    for future in concurrent.futures.as_completed(future_to_offset):
-                        offset = future_to_offset[future]
-                        try:
-                            entries = future.result()
-                            all_entries.extend(entries)
-                            print(f"Found {len(all_entries)}/{total_count} entries for {card_reference_id}")
-                        except Exception as e:
-                            print(f"Error fetching offset {offset}: {str(e)}")
-
-            print(f"Finished fetching VCCs for {card_reference_id}. Found {len(all_entries)}/{total_count} entries")
-            return all_entries
-
         entries = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_card = {executor.submit(fetch_vcc, card_id, search): card_id for card_id in self.card_ids}
+            future_to_card = {
+                executor.submit(self._fetch_card_vccs, card_id, search): card_id 
+                for card_id in self.card_ids
+            }
             for future in concurrent.futures.as_completed(future_to_card):
                 entries.extend(future.result())
 
         print("Found", len(entries), "VCCs across all accounts")
-
         return entries
     
     def delete_all_vccs(self, entries: list[VCCEntry], exp_date: str = None) -> None:
