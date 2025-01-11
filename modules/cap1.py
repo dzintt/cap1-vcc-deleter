@@ -81,8 +81,18 @@ class CapitalOneVCCDeleter:
         self.session.headers["accept"] = "application/json;v=1"
         response = self.session.get("https://myaccounts.capitalone.com/web-api/private/1491939/edge/customer/profile/preferences")
         result = response.json()
+        if "accountDisplayOrder" not in result:
+            return self.get_accounts_v2()
         print("Found", len(result["accountDisplayOrder"]), "cards")
         self.card_ids = result["accountDisplayOrder"]
+        return self.card_ids
+    
+    def get_accounts_v2(self) -> list[str]:
+        self.session.headers["accept"] = "application/json;v=1"
+        response = self.session.get("https://myaccounts.capitalone.com/web-api/protected/636178/customer-accounts?versionUpgrade=false")
+        result = response.json()
+        print("Found", len(result["entries"]), "cards")
+        self.card_ids = [entry["accountReferenceId"] for entry in result["entries"]]
         return self.card_ids
 
     def get_all_vccs(self, search: str = None) -> list[VCCEntry]:
